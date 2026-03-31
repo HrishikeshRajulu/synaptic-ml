@@ -46,7 +46,7 @@ Backends
 - brainscales: BrainScaleS-2 (requires pynn_brainscales + EBRAINS access)
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.3"
 __author__ = "synaptic_ml contributors"
 
 # Core
@@ -69,7 +69,7 @@ from .learning import (
 from .training import Trainer
 
 # Backends
-from .backends import CPUBackend, Loihi2Backend, BrainScalesBackend, get_backend
+from .backends import CPUBackend, Loihi2Backend, BrainScalesBackend, AkidaBackend, get_backend
 
 # Utils
 from .utils import (
@@ -94,7 +94,7 @@ __all__ = [
     # Training
     "Trainer",
     # Backends
-    "CPUBackend", "Loihi2Backend", "BrainScalesBackend", "get_backend",
+    "CPUBackend", "Loihi2Backend", "BrainScalesBackend", "AkidaBackend", "get_backend",
     # Utils
     "spike_rate", "estimate_energy_joules", "van_rossum_distance",
     "coincidence_factor", "energy_comparison_table",

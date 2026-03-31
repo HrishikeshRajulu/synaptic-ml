@@ -1,8 +1,12 @@
 # synaptic_ml
 
+[![PyPI version](https://img.shields.io/pypi/v/synaptic-ml)](https://pypi.org/project/synaptic-ml/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
+
 **The TensorFlow for Neuromorphic Computing.**
 
-Train spiking neural networks. Deploy to neuromorphic chips. Use 1000× less energy than GPU.
+Train spiking neural networks. Deploy to neuromorphic chips. Use 1000x less energy than GPU.
 
 ```python
 import synaptic_ml as sml
@@ -11,18 +15,16 @@ import synaptic_ml as sml
 model = sml.SpikingNet([784, 256, 10])
 model.summary()
 
-# Train with surrogate gradients (like backprop, but for spikes)
+# Train with surrogate gradients
 model.train(X_train, y_train, epochs=10)
-
-# Evaluate
-predictions = model.predict(X_test)
 
 # See the energy advantage
 print(sml.energy_comparison_table(model))
 
 # Deploy to neuromorphic hardware
-model.deploy(target='loihi2')      # Intel Loihi 2
-model.deploy(target='brainscales') # BrainScaleS-2
+model.deploy(target='akida')       # BrainChip Akida (works today, pip install akida)
+model.deploy(target='loihi2')      # Intel Loihi 2 (via Lava framework)
+model.deploy(target='brainscales') # BrainScaleS-2 (via PyNN)
 model.deploy(target='cpu')         # CPU simulation (default, always works)
 ```
 
@@ -30,14 +32,14 @@ model.deploy(target='cpu')         # CPU simulation (default, always works)
 
 ## Why neuromorphic?
 
-| | GPU (A100) | Intel Loihi 2 | Human Brain |
-|--|--|--|--|
-| Power | 300W | 30mW | 20W |
-| Energy/inference | ~1000 nJ | ~0.1 nJ | ~0.001 nJ |
-| Efficiency | baseline | **10,000× better** | **1,000,000× better** |
+| | GPU (A100) | Intel Loihi 2 | BrainChip Akida | Human Brain |
+|--|--|--|--|--|
+| Power | 300W | 30mW | 30mW | 20W |
+| Energy/inference | ~1000 nJ | ~0.1 nJ | ~1.4 nJ | ~0.001 nJ |
+| Available | Yes | Research only | **Yes — buy now** | No |
 
-The brain uses 20 watts. GPT-4 uses 50 megawatts. That's a 2.5 million× gap.  
-Neuromorphic chips close that gap — and `synaptic_ml` makes them programmable.
+The brain uses 20 watts. GPT-4 uses 50 megawatts. That is a 2.5 million x gap.
+Neuromorphic chips close that gap. `synaptic_ml` makes them programmable.
 
 ---
 
@@ -45,26 +47,54 @@ Neuromorphic chips close that gap — and `synaptic_ml` makes them programmable.
 
 ```bash
 pip install synaptic-ml
-# or from source:
-git clone https://github.com/yourusername/synaptic-ml
-pip install -e .
 ```
 
-**Optional extras:**
+**Optional hardware backends:**
 ```bash
-pip install synaptic-ml[torch]    # PyTorch ANN→SNN conversion
-pip install synaptic-ml[sklearn]  # MNIST examples
-pip install synaptic-ml[all]      # Everything
+pip install akida        # BrainChip Akida (recommended — works without hardware)
+pip install lava-nc      # Intel Loihi 2 via Lava (requires Python 3.10)
+pip install pyNN         # BrainScaleS-2 / SpiNNaker 2
 ```
 
 ---
 
-## Core Concepts
+## Hardware Backends
 
-### Neuron Models
+| Backend | Chip | Install | Hardware needed? |
+|---------|------|---------|-----------------|
+| `cpu` | CPU simulation | built-in | No |
+| `akida` | BrainChip AKD1000/AKD1500 | `pip install akida` | No (virtual mode) |
+| `loihi2` | Intel Loihi 2 | `pip install lava-nc` | No (CPU sim via Lava) |
+| `brainscales` | BrainScaleS-2 | `pip install pyNN` | Apply at ebrains.eu |
+
+### BrainChip Akida — works today
 
 ```python
-# Leaky Integrate-and-Fire (default, fast, efficient)
+# No hardware needed — runs in virtual simulation
+backend = model.deploy(target='akida')
+
+# With real AKD1000/AKD1500 hardware connected
+backend = model.deploy(target='akida', use_hardware=True)
+```
+
+Buy Akida hardware: [brainchipinc.com/products](https://brainchipinc.com/products)
+
+### Intel Loihi 2 — via Lava
+
+```python
+# Lava is Intel's official open-source neuromorphic framework
+# synaptic_ml sits on top of it as a friendly API layer
+backend = model.deploy(target='loihi2')
+```
+
+For real Loihi 2 hardware, join the INRC: [neuromorphic.intel.com](http://neuromorphic.intel.com)
+
+---
+
+## Neuron Models
+
+```python
+# Leaky Integrate-and-Fire (default, fast)
 model = sml.SpikingNet([784, 256, 10], neuron='lif')
 
 # Adaptive LIF (spike-frequency adaptation)
@@ -74,32 +104,34 @@ model = sml.SpikingNet([784, 256, 10], neuron='adaptive_lif')
 model = sml.SpikingNet([784, 256, 10], neuron='izhikevich')
 ```
 
-### Spike Encoders
+---
+
+## Spike Encoders
 
 ```python
-import synaptic_ml as sml
 import numpy as np
+x = np.random.rand(784)  # values in [0, 1]
 
-x = np.random.rand(784)  # your data, values in [0, 1]
-
-# Rate coding: spike probability ∝ value (most common)
+# Rate coding — spike probability proportional to value (most common)
 enc = sml.RateEncoder(time_steps=100, max_rate=100)
 spikes = enc.encode(x)  # shape: (100, 784)
 
-# Temporal: earlier spike = stronger signal (most energy efficient)
+# Temporal — earlier spike = stronger signal (most energy efficient)
 enc = sml.TemporalEncoder(time_steps=100)
 spikes = enc.encode(x)  # at most 1 spike per neuron
 
-# Population: Gaussian tuning curves (most biologically realistic)
+# Population — Gaussian tuning curves (most biologically realistic)
 enc = sml.PopulationEncoder(n_neurons=10, sigma=0.5)
-spikes = enc.encode(x)  # shape: (100, 7840)
+spikes = enc.encode(x)
 
-# Delta: spikes only on change — perfect for IoT/sensors
+# Delta — spikes only on change (perfect for IoT sensors)
 enc = sml.DeltaEncoder(threshold=0.05)
-spikes = enc.encode_series(time_series)  # event-driven
+spikes = enc.encode_series(time_series)
 ```
 
-### Learning Rules
+---
+
+## Learning Rules
 
 ```python
 # Surrogate gradients (recommended) — backprop through spikes
@@ -108,62 +140,52 @@ model.train(X, y, learning_rule='surrogate', learning_rate=0.001)
 # STDP — unsupervised, no labels needed, biologically inspired
 model.train(X, y, learning_rule='stdp')
 
-# Custom trainer
+# Custom trainer with validation
 trainer = sml.Trainer(model, learning_rule='surrogate', learning_rate=0.001)
 trainer.fit(X_train, y_train, epochs=10, validation_split=0.1)
 trainer.evaluate(X_test, y_test)
 ```
 
-### ANN → SNN Conversion
+---
 
-Convert your existing PyTorch/Keras models to SNNs in one line:
+## ANN to SNN Conversion
+
+Convert your existing PyTorch or Keras models to SNNs in one line:
 
 ```python
 import torch.nn as nn
-import synaptic_ml as sml
 
-# Your existing trained ANN
+# Your trained ANN
 ann = nn.Sequential(nn.Linear(784, 256), nn.ReLU(), nn.Linear(256, 10))
 
-# Convert to SNN (threshold balancing method)
+# Convert to SNN (threshold balancing)
 snn = sml.convert_from_pytorch(ann, X_calibration, time_steps=100)
 
 # Deploy to neuromorphic hardware
-snn.deploy(target='loihi2')
+snn.deploy(target='akida')
 ```
 
-### Hardware Backends
+---
+
+## Energy Analysis
 
 ```python
-# CPU simulation — always works, no hardware needed
-backend = model.deploy(target='cpu')
-
-# Intel Loihi 2 — requires NxSDK (Intel Research Program)
-# Apply at: intel.com/loihi
-backend = model.deploy(target='loihi2')
-
-# BrainScaleS-2 — requires EBRAINS access (Human Brain Project)  
-# Apply at: ebrains.eu
-backend = model.deploy(target='brainscales')
-```
-
-### Energy Analysis
-
-```python
-# After running predictions:
+# After running predictions
 model.predict(X_test)
 
 # Detailed energy breakdown
 energy = model.estimate_energy()
 print(f"Ops/inference:    {energy['synaptic_ops_per_inference']:,.0f}")
 print(f"Energy/inference: {energy['energy_per_inference_nJ']:.4f} nJ")
-print(f"vs GPU:           {energy['efficiency_gain']:.0f}× more efficient")
+print(f"vs GPU:           {energy['efficiency_gain']:.0f}x more efficient")
 
 # Full comparison table
 print(sml.energy_comparison_table(model))
 ```
 
-### Save / Load
+---
+
+## Save / Load
 
 ```python
 model.save('my_snn.snm')
@@ -175,7 +197,7 @@ model = sml.SpikingNet.load('my_snn.snm')
 ## Examples
 
 ```bash
-# MNIST classification with LIF neurons
+# MNIST classification with LIF neurons + surrogate gradients
 python examples/mnist_lif.py
 
 # Unsupervised pattern learning with STDP
@@ -206,13 +228,14 @@ synaptic_ml/
 ├── learning/
 │   ├── stdp.py         # STDP, reward-modulated STDP
 │   ├── surrogate.py    # Surrogate gradient functions
-│   └── conversion.py   # ANN→SNN threshold balancing
+│   └── conversion.py   # ANN->SNN threshold balancing
 ├── backends/
 │   ├── cpu.py          # Pure numpy simulation
-│   ├── loihi2.py       # Intel Loihi 2 (NxSDK)
-│   └── brainscales.py  # BrainScaleS-2 (PyNN)
+│   ├── akida.py        # BrainChip Akida (pip install akida)
+│   ├── loihi2.py       # Intel Loihi 2 (via Lava)
+│   └── brainscales.py  # BrainScaleS-2 (via PyNN)
 ├── training/
-│   └── trainer.py      # Training loop, loss functions
+│   └── trainer.py      # Training loop, surrogate + STDP
 └── utils/
     ├── metrics.py      # Energy, spike metrics, Van Rossum distance
     └── visualization.py # Raster plots, membrane traces, energy bars
@@ -220,31 +243,42 @@ synaptic_ml/
 
 ---
 
-## Hardware Access
+## Roadmap
 
-Neither Loihi 2 nor BrainScaleS requires purchase — they're available through research programs:
-
-- **Intel Loihi 2**: [Intel Neuromorphic Research Community](https://www.intel.com/content/www/us/en/research/neuromorphic-computing.html)
-- **BrainScaleS-2**: [EBRAINS / Human Brain Project](https://www.ebrains.eu/)
-
-Until you get hardware access, the CPU backend gives exact simulation results.
+- [x] LIF, Adaptive LIF, Izhikevich neuron models
+- [x] Rate, Temporal, Population, Delta encoders
+- [x] Surrogate gradient + STDP training
+- [x] ANN->SNN conversion (PyTorch + Keras)
+- [x] BrainChip Akida backend (fully working)
+- [x] Intel Loihi 2 backend (via Lava)
+- [x] BrainScaleS-2 backend (via PyNN)
+- [ ] GPU simulation (CuPy backend)
+- [ ] SpiNNaker 2 backend
+- [ ] Innatera T1 backend
+- [ ] IBM NorthPole backend (when SDK releases)
+- [ ] Quantization-aware training
+- [ ] Online/streaming inference API
+- [ ] Pretrained model hub
 
 ---
 
-## Roadmap
+## Contributing
 
-- [ ] GPU-accelerated simulation (CuPy backend)
-- [ ] Innatera T1 chip support
-- [ ] Online/streaming inference API
-- [ ] Quantization-aware training
-- [ ] Multi-chip deployment
-- [ ] Web dashboard for spike visualization
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Most needed right now:
+- Someone with **Loihi 2 hardware** to test and fix the Loihi 2 backend
+- Someone with **Akida AKD1000/AKD1500** hardware to test hardware mode
+- **GPU simulation** via CuPy
+- **Tests** — pytest coverage
 
 ---
 
 ## License
 
-MIT License. See LICENSE.
+MIT License — see [LICENSE](LICENSE).
+
+Copyright (c) 2026 Hrishikesh Rajulu
 
 ---
 

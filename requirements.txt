@@ -9,7 +9,7 @@ tqdm>=4.62
 # Optional: for MNIST example
 # scikit-learn>=0.24
 
-# Optional: hardware backends (requires special access)
-# nxsdk              # Intel Loihi 2 (apply at intel.com/loihi)
+# Optional: hardware backends
+# lava-nc            # Intel Loihi 2 via Lava (pip install lava-nc)
 # pynn_brainscales   # BrainScaleS-2 (apply at ebrains.eu)
 # hxtorch            # BrainScaleS-2 PyTorch interface

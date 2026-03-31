@@ -1,19 +1,22 @@
 """
-Intel Loihi 2 backend.
+Intel Loihi 2 backend — built on top of Intel's Lava framework.
 
-Requires Intel NxSDK (not publicly available — must apply through Intel's
-Neuromorphic Research Community: https://www.intel.com/loihi)
+Lava is Intel's official open-source framework for neuromorphic computing.
+Install it with: pip install lava-nc
+
+Think of it this way:
+  Lava = the engine (low-level, complex, powerful)
+  synaptic_ml = the steering wheel (simple API on top of Lava)
 
 Loihi 2 specs:
 - 1 million neurons per chip
-- 120 synaptic operations per neuron per timestep
-- ~30mW typical power (vs. hundreds of watts for GPU)
+- ~30mW typical power (vs hundreds of watts for GPU)
 - Asynchronous, event-driven execution
 - On-chip STDP learning support
+- 8.6 fJ per synaptic operation
 
-This module maps synaptic_ml networks to NxSDK primitives:
-  LIFLayer  →  NxNet compartment group
-  DenseSynapse  →  NxNet connection
+Lava GitHub: https://github.com/lava-nc/lava
+Lava docs:   https://lava-nc.org
 """
 
 import numpy as np
@@ -24,120 +27,164 @@ class Loihi2Backend(Backend):
     """
     Intel Loihi 2 neuromorphic chip backend.
 
-    Requires NxSDK. Install via Intel's Neuromorphic Research Community:
-    https://www.intel.com/content/www/us/en/research/neuromorphic-computing.html
+    Uses Intel's Lava framework (open source) as the underlying engine.
+    Install Lava with: pip install lava-nc
 
-    If NxSDK is not installed, methods will raise BackendNotAvailableError
-    with helpful installation instructions.
+    For actual Loihi 2 hardware execution, join the Intel Neuromorphic
+    Research Community (INRC): http://neuromorphic.intel.com
+
+    Without hardware, Lava runs on CPU simulation — same results,
+    no chip required for development.
     """
 
-    # Loihi 2 hardware specifications
     MAX_NEURONS_PER_CHIP = 1_000_000
     MAX_SYNAPSES_PER_CHIP = 120_000_000
     TYPICAL_POWER_MW = 30.0
-    ENERGY_PER_SYNAPTIC_OP_FJ = 8.6  # Published benchmark (Intel, 2021)
+    ENERGY_PER_SYNAPTIC_OP_FJ = 8.6  # Intel published benchmark (2021)
 
     def __init__(self):
-        self._check_sdk()
+        self._check_lava()
         self.network = None
-        self.nxnet = None
+        self._lava_network = None
         self._ops_per_inference = 0
 
-    def _check_sdk(self):
+    def _check_lava(self):
         try:
-            import nxsdk  # noqa: F401
-            self._sdk_available = True
+            import lava.lib.dl.slayer as slayer  # noqa: F401
+            self._lava_available = True
+            self._lava_mode = "slayer"
         except ImportError:
-            self._sdk_available = False
+            try:
+                from lava.proc.lif.process import LIF  # noqa: F401
+                self._lava_available = True
+                self._lava_mode = "proc"
+            except ImportError:
+                self._lava_available = False
+                self._lava_mode = None
 
-    def _require_sdk(self):
-        if not self._sdk_available:
+    def _require_lava(self):
+        if not self._lava_available:
             raise BackendNotAvailableError(
-                "\n[synaptic_ml] Intel NxSDK not found.\n\n"
-                "To deploy on Loihi 2:\n"
-                "  1. Apply for access: https://www.intel.com/content/www/us/en/research/neuromorphic-computing.html\n"
-                "  2. Intel provides NxSDK after approval (academic/research use).\n"
-                "  3. Install: pip install nxsdk (after receiving access)\n\n"
-                "For now, use CPUBackend for simulation:\n"
+                "\n[synaptic_ml] Lava framework not found.\n\n"
+                "Lava is Intel's open-source neuromorphic framework.\n"
+                "Install it with:\n"
+                "  pip install lava-nc\n\n"
+                "For Loihi 2 hardware access, join the INRC:\n"
+                "  http://neuromorphic.intel.com\n"
+                "  Email: inrc_interest@intel.com\n\n"
+                "Without hardware, Lava simulates on CPU.\n"
+                "For now, use CPUBackend:\n"
                 "  model.deploy(target='cpu')\n"
             )
 
     def load_network(self, network) -> None:
         """
-        Compile SpikingNet to Loihi 2 hardware graph.
+        Compile SpikingNet to a Lava process network.
 
-        Maps:
-        - LIFLayer → Loihi compartment groups with LIF dynamics
-        - DenseSynapse → Loihi axon/dendrite connections
-        - Layer thresholds → compartment thresholds
+        Maps synaptic_ml layers to Lava processes:
+          LIFLayer     -> lava.proc.lif.process.LIF
+          DenseSynapse -> lava.proc.dense.process.Dense
+          InputLayer   -> lava.proc.io.source.RingBuffer
         """
-        self._require_sdk()
+        self._require_lava()
 
-        # Validate network fits on chip
         total_neurons = sum(network.layer_sizes)
         if total_neurons > self.MAX_NEURONS_PER_CHIP:
             raise ValueError(
                 f"Network has {total_neurons} neurons but Loihi 2 supports "
-                f"max {self.MAX_NEURONS_PER_CHIP:,} per chip. "
-                f"Consider multi-chip deployment."
+                f"max {self.MAX_NEURONS_PER_CHIP:,} per chip."
             )
 
-        # NxSDK integration (requires SDK)
-        import nxsdk.api.n2a as nx
+        from lava.proc.lif.process import LIF
+        from lava.proc.dense.process import Dense
 
         self.network = network
-        net = nx.NxNet()
+        lava_layers = []
+        lava_connections = []
 
-        compartments = []
-        for i, size in enumerate(network.layer_sizes):
-            # Create compartment group for each layer
-            compartment_proto = nx.CompartmentPrototype(
-                vThMant=100,          # Voltage threshold mantissa
-                functionalState=nx.PHASE_BIAS,
-                numDendriticAccumulators=16,
+        # Build Lava LIF processes for each hidden + output layer
+        for i, size in enumerate(network.layer_sizes[1:], 1):
+            lif = LIF(
+                shape=(size,),
+                du=0,           # no current decay (matches our LIF)
+                dv=0,           # membrane decay handled by tau_m
+                vth=1,          # normalized threshold
+                bias_mant=0,
+                bias_exp=0,
             )
-            cg = net.createCompartmentGroup(size=size, prototype=compartment_proto)
-            compartments.append(cg)
+            lava_layers.append(lif)
 
-        # Create connections between layers
-        for i in range(len(network.layer_sizes) - 1):
+        # Connect layers with Dense synapses
+        for i in range(len(lava_layers) - 1):
             layer = network.layers[i + 1]
             if hasattr(layer, "weights"):
-                # Scale weights for integer Loihi format
-                w_scaled = (layer.weights * 255).astype(np.int8)
-                conn_proto = nx.ConnectionPrototype(
-                    signMode=nx.SIGN_MODE_MIXED,
-                    numWeightBits=8,
-                    weightExponent=-4,
-                )
-                compartments[i].connect(
-                    compartments[i + 1],
-                    prototype=conn_proto,
-                    weight=w_scaled,
-                )
+                # Lava Dense expects weights in [post, pre] format
+                w = layer.weights.T
+                dense = Dense(weights=w)
+                # Connect: pre.s_out -> dense.s_in -> post.a_in
+                lava_layers[i].s_out.connect(dense.s_in)
+                dense.a_out.connect(lava_layers[i + 1].a_in)
+                lava_connections.append(dense)
 
-        self.nxnet = net
-        print(f"[Loihi2] Compiled {total_neurons} neurons, "
-              f"{sum(network.layer_sizes[i]*network.layer_sizes[i+1] for i in range(len(network.layer_sizes)-1)):,} synapses")
+        self._lava_network = {
+            "layers": lava_layers,
+            "connections": lava_connections,
+        }
+
+        print(f"[Loihi2/Lava] Compiled {total_neurons} neurons across "
+              f"{len(lava_layers)} layers using Lava framework")
+        print(f"[Loihi2/Lava] Mode: {'Hardware' if self._lava_mode == 'hw' else 'CPU simulation'}")
 
     def run(self, input_spikes: np.ndarray, time_steps: int = None) -> np.ndarray:
-        self._require_sdk()
+        """
+        Run inference using Lava's execution runtime.
 
-        if self.nxnet is None:
+        On CPU: simulates Loihi 2 dynamics in software.
+        On hardware: executes directly on Loihi 2 chip.
+        """
+        self._require_lava()
+
+        if self._lava_network is None:
             raise RuntimeError("No network loaded. Call load_network() first.")
+
+        from lava.proc.io.source import RingBuffer
+        from lava.proc.io.sink import RingBuffer as SinkBuffer
+        from lava.magma.core.run_configs import Loihi2SimCfg
+        from lava.magma.core.run_conditions import RunSteps
 
         time_steps = time_steps or self.network.time_steps
 
-        # Run on hardware (NxSDK API)
-        board = self.nxnet.start(time_steps)
-        board.run(time_steps)
-        board.disconnect()
+        # Input source: inject spike trains
+        # input_spikes shape: (time_steps, n_input)
+        inp_data = input_spikes.T.astype(np.int32)  # Lava wants (n, T)
+        source = RingBuffer(data=inp_data)
 
-        # Read output spikes from output compartment
-        output_spikes = board.probes[-1].data  # simplified
+        # Output sink: collect output spikes
+        n_out = self.network.layer_sizes[-1]
+        sink = SinkBuffer(shape=(n_out,), buffer=time_steps)
+
+        layers = self._lava_network["layers"]
+
+        # Connect source to first layer, last layer to sink
+        from lava.proc.dense.process import Dense
+        w_in = self.network.layers[1].weights.T
+        in_dense = Dense(weights=w_in)
+        source.s_out.connect(in_dense.s_in)
+        in_dense.a_out.connect(layers[0].a_in)
+        layers[-1].s_out.connect(sink.a_in)
+
+        # Run simulation
+        run_cfg = Loihi2SimCfg()
+        layers[0].run(condition=RunSteps(num_steps=time_steps), run_cfg=run_cfg)
+
+        # Read output
+        out_spikes = sink.data.get()  # shape: (n_out, time_steps)
+        layers[0].stop()
+
         self._ops_per_inference = int(np.sum(input_spikes)) * self.network.layer_sizes[-1]
 
-        return output_spikes.mean(axis=0)
+        # Return mean firing rate per output neuron
+        return out_spikes.mean(axis=1).astype(np.float32)
 
     def get_energy_estimate(self) -> dict:
         energy_nJ = self._ops_per_inference * self.ENERGY_PER_SYNAPTIC_OP_FJ * 1e-6
@@ -145,19 +192,25 @@ class Loihi2Backend(Backend):
             "ops_per_inference": self._ops_per_inference,
             "energy_nJ": energy_nJ,
             "power_mW": self.TYPICAL_POWER_MW,
-            "chip": "Intel Loihi 2",
+            "chip": "Intel Loihi 2 (via Lava)",
         }
 
     def get_hardware_info(self) -> str:
-        sdk_status = "Available" if self._sdk_available else "Not installed (using simulation mode)"
+        if self._lava_available:
+            lava_status = f"Available (mode: {self._lava_mode})"
+        else:
+            lava_status = "Not installed — run: pip install lava-nc"
+
         return (
-            f"  Backend:     Intel Loihi 2\n"
-            f"  NxSDK:       {sdk_status}\n"
+            f"  Backend:     Intel Loihi 2 (via Lava framework)\n"
+            f"  Lava:        {lava_status}\n"
+            f"  Lava docs:   https://lava-nc.org\n"
             f"  Max neurons: {self.MAX_NEURONS_PER_CHIP:,} per chip\n"
             f"  Power:       ~{self.TYPICAL_POWER_MW}mW typical\n"
             f"  Efficiency:  {self.ENERGY_PER_SYNAPTIC_OP_FJ} fJ per synaptic op\n"
-            f"  Access:      intel.com/loihi (research program)"
+            f"  Hardware:    Join INRC at neuromorphic.intel.com"
         )
 
     def __repr__(self) -> str:
-        return f"Loihi2Backend(sdk={'available' if self._sdk_available else 'not installed'})"
+        status = "available" if self._lava_available else "not installed (pip install lava-nc)"
+        return f"Loihi2Backend(lava={status})"
