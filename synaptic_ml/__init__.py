@@ -46,7 +46,7 @@ Backends
 - brainscales: BrainScaleS-2 (requires pynn_brainscales + EBRAINS access)
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "synaptic_ml contributors"
 
 # Core
