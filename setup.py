@@ -10,7 +10,7 @@ setup(
     description="The TensorFlow for neuromorphic computing — high-level SNN framework",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/synaptic-ml",
+    url="https://github.com/HrishikeshRajulu/synaptic-ml",
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=[
