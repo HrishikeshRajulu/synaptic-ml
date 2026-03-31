@@ -45,7 +45,7 @@ class SpikingNet:
         neuron: Literal["lif", "adaptive_lif", "izhikevich"] = "lif",
         dt: float = 1.0,
         time_steps: int = 100,
-        decoder: str = "rate",
+        decoder: str = "max_voltage",
     ):
         if len(layer_sizes) < 2:
             raise ValueError("Need at least 2 layer sizes (input + output).")
@@ -64,7 +64,7 @@ class SpikingNet:
 
         for i in range(1, len(sizes) - 1):
             if neuron_type == "lif":
-                layers.append(LIFLayer(sizes[i - 1], sizes[i]))
+                layers.append(LIFLayer(sizes[i - 1], sizes[i], synapse_init="xavier"))
             elif neuron_type == "adaptive_lif":
                 layers.append(AdaptiveLIFLayer(sizes[i - 1], sizes[i]))
             elif neuron_type == "izhikevich":
@@ -88,6 +88,9 @@ class SpikingNet:
         """
         Run the network for one sample over `time_steps` timesteps.
 
+        Uses soft voltage-based readout (consistent with surrogate gradient training).
+        For hardware deployment, use the backend's run() method instead.
+
         Parameters
         ----------
         encoded_input : np.ndarray, shape (time_steps, n_input)
@@ -98,18 +101,42 @@ class SpikingNet:
         class_scores : np.ndarray, shape (n_output,)
         """
         self._reset_all()
+        T = self.time_steps
+        soft_accum = None
         spike_count = 0
 
-        for t in range(self.time_steps):
+        for t in range(T):
             x = encoded_input[t] if t < len(encoded_input) else np.zeros(self.layer_sizes[0])
-            spikes = x
+            t_soft = [x.astype(np.float32)]
+            current = x.astype(np.float32)
+
             for layer in self.layers:
-                spikes = layer.forward(spikes, self.dt)
-            spike_count += int(np.sum(spikes))
+                current = layer.forward(current, self.dt)
+                if hasattr(layer, 'neurons') and hasattr(layer.neurons, 'v'):
+                    v = layer.neurons.v.copy()
+                    v_rest = getattr(layer.neurons, 'v_rest', -65.0)
+                    v_thresh = getattr(layer.neurons, 'v_thresh', -50.0)
+                    soft = np.clip((v - v_rest) / (v_thresh - v_rest + 1e-8), 0.0, 1.0)
+                    t_soft.append(soft)
+                else:
+                    t_soft.append(current.copy())
+                spike_count += int(np.sum(current > 0))
+
+            if soft_accum is None:
+                soft_accum = [np.zeros_like(s) for s in t_soft]
+            for i, s in enumerate(t_soft):
+                soft_accum[i] += s
 
         self._total_synaptic_ops += spike_count
         self._inference_count += 1
 
+        # Soft linear readout — same method used during surrogate gradient training
+        weight_layers = [l for l in self.layers if hasattr(l, 'synapse')]
+        if weight_layers:
+            out_wl = weight_layers[-1]
+            layer_idx = self.layers.index(out_wl)
+            avg_pre = soft_accum[layer_idx] / T
+            return avg_pre @ out_wl.synapse.weights
         return self.layers[-1].decode()
 
     def predict(self, X: np.ndarray, encoder=None, verbose: bool = True) -> np.ndarray:

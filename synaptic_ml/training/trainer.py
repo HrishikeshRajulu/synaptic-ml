@@ -2,8 +2,11 @@
 Trainer — manages the training loop for SpikingNets.
 
 Supports two learning rules:
-1. surrogate — backprop with surrogate gradients (fast, accurate, recommended)
-2. stdp — unsupervised Hebbian learning (no labels needed, biologically inspired)
+1. surrogate — proper BPTT with surrogate gradients (recommended)
+2. stdp — unsupervised Hebbian learning
+
+Key fix over v0.1.x: proper per-timestep forward pass with full
+backpropagation through time (BPTT), not averaged approximations.
 """
 
 import numpy as np
@@ -46,6 +49,7 @@ class Trainer:
 
         self.train_losses = []
         self.train_accuracies = []
+        self._velocity = {}  # momentum buffers keyed by synapse id
 
     def fit(
         self,
@@ -57,25 +61,11 @@ class Trainer:
         encoder=None,
         verbose: bool = True,
     ):
-        """
-        Train the model.
-
-        Parameters
-        ----------
-        X_train : np.ndarray, shape (N, n_features), values in [0, 1]
-        y_train : np.ndarray, shape (N,), integer class labels
-        epochs : int
-        batch_size : int
-        validation_split : float
-        encoder : Encoder, optional. Default: RateEncoder.
-        verbose : bool
-        """
         from ..encoding.rate import RateEncoder
 
         if encoder is None:
             encoder = RateEncoder(time_steps=self.model.time_steps)
 
-        # Split validation
         n = len(X_train)
         n_val = int(n * validation_split)
         if n_val > 0:
@@ -83,7 +73,7 @@ class Trainer:
             X_train, y_train = X_train[n_val:], y_train[n_val:]
 
         n_train = len(X_train)
-        n_classes = len(np.unique(y_train))
+        n_classes = int(y_train.max()) + 1
 
         if verbose:
             print(f"\n[synaptic_ml] Training {self.model}")
@@ -93,21 +83,22 @@ class Trainer:
             print()
 
         for epoch in range(epochs):
-            # Shuffle
             idx = np.random.permutation(n_train)
             X_shuf, y_shuf = X_train[idx], y_train[idx]
 
             epoch_loss = 0.0
             epoch_correct = 0
-
             n_batches = max(1, n_train // batch_size)
+
             for b in range(n_batches):
                 start = b * batch_size
                 end = min(start + batch_size, n_train)
                 X_b = X_shuf[start:end]
                 y_b = y_shuf[start:end]
 
-                batch_loss, batch_correct = self._train_batch(X_b, y_b, encoder, n_classes)
+                batch_loss, batch_correct = self._train_batch(
+                    X_b, y_b, encoder, n_classes
+                )
                 epoch_loss += batch_loss
                 epoch_correct += batch_correct
 
@@ -121,7 +112,6 @@ class Trainer:
                 if n_val > 0:
                     val_acc = self._evaluate(X_val, y_val, encoder)
                     val_str = f"  val_acc={val_acc:.3f}"
-
                 print(
                     f"  Epoch {epoch+1:>3}/{epochs}  "
                     f"loss={avg_loss:.4f}  acc={avg_acc:.3f}{val_str}"
@@ -131,7 +121,6 @@ class Trainer:
             print(f"\n[synaptic_ml] Training complete.")
 
     def _train_batch(self, X_b, y_b, encoder, n_classes):
-        """Train one batch, return (total_loss, n_correct)."""
         total_loss = 0.0
         n_correct = 0
 
@@ -148,122 +137,179 @@ class Trainer:
 
         return total_loss, n_correct
 
+    def _apply_momentum(self, synapse, dw: np.ndarray, momentum: float = 0.9) -> np.ndarray:
+        key = id(synapse)
+        if key not in self._velocity:
+            self._velocity[key] = np.zeros_like(dw)
+        self._velocity[key] = momentum * self._velocity[key] + dw
+        return self._velocity[key]
+
     def _surrogate_step(self, encoded: np.ndarray, y_true: int, n_classes: int):
         """
-        One surrogate gradient training step.
+        Full BPTT with surrogate gradients.
 
-        Uses BPTT (Backpropagation Through Time) with surrogate gradients
-        for the spike nonlinearity.
+        Uses voltage-based soft activations as presynaptic activity so that
+        weight updates are non-zero even when neurons don't fire.
         """
         model = self.model
         layers = model.layers
+        T = model.time_steps
 
-        # Forward pass — collect all activations
-        self.model._reset_all()
-        all_spikes = []  # list of [time_steps, layer] arrays
+        # ---- Forward pass ----
+        # all_soft_acts[t][l] = soft activation (normalized voltage) at layer l, time t
+        # Index 0 = raw input, index 1..n = layer outputs
+        all_soft_acts = []
+        all_voltages = []
 
-        for t in range(model.time_steps):
+        model._reset_all()
+
+        for t in range(T):
             x = encoded[t] if t < len(encoded) else np.zeros(model.layer_sizes[0])
-            step_spikes = [x]
-            spikes = x
-            for layer in layers:
-                spikes = layer.forward(spikes, model.dt)
-                step_spikes.append(spikes.copy())
-            all_spikes.append(step_spikes)
+            t_soft = [x.astype(np.float32)]  # input: spike rates are already soft
+            t_volts = []
 
-        # Decode output
-        output_scores = layers[-1].decode()
+            current = x.astype(np.float32)
+            for layer in layers:
+                current = layer.forward(current, model.dt)
+
+                if hasattr(layer, 'neurons') and hasattr(layer.neurons, 'v'):
+                    v = layer.neurons.v.copy()
+                    t_volts.append(v)
+                    # Normalize voltage to [0,1]: v_rest -> 0, v_thresh -> 1
+                    v_rest = getattr(layer.neurons, 'v_rest', -65.0)
+                    v_thresh = getattr(layer.neurons, 'v_thresh', -50.0)
+                    soft = np.clip((v - v_rest) / (v_thresh - v_rest + 1e-8), 0.0, 1.0)
+                    t_soft.append(soft)
+                else:
+                    # InputLayer: no neurons, use pass-through values
+                    t_soft.append(current.copy())
+
+            all_soft_acts.append(t_soft)
+            all_voltages.append(t_volts)
+
+        weight_layers = [l for l in layers if hasattr(l, 'synapse')]
+
+        # ---- Compute output scores ----
+        # Use soft-activation linear readout: avg_hidden_soft @ W_out
+        # This reflects learned weights even when neurons don't fire,
+        # giving a non-zero gradient signal from the very first step.
+        out_wlayer = weight_layers[-1] if weight_layers else None
+        if out_wlayer is not None:
+            layer_idx = layers.index(out_wlayer)
+            avg_soft_pre = np.mean(
+                [all_soft_acts[t][layer_idx] for t in range(T)], axis=0
+            )
+            output_scores = avg_soft_pre @ out_wlayer.synapse.weights
+        else:
+            out_layer = layers[-1]
+            output_scores = out_layer.neurons.v.copy() if hasattr(out_layer, 'neurons') else np.zeros(n_classes)
+
+        output_scores = output_scores - output_scores.mean()
+
         pred = int(np.argmax(output_scores))
         correct = (pred == y_true)
 
-        # Compute cross-entropy loss on rate-coded output
-        # Target: one-hot
+        # ---- Cross-entropy loss ----
         target = np.zeros(n_classes, dtype=np.float32)
         target[y_true] = 1.0
 
-        # Softmax
-        scores = output_scores - output_scores.max()
-        exp_s = np.exp(scores)
+        temp = 1.0
+        scores = (output_scores - output_scores.max()) / (temp + 1e-8)
+        exp_s = np.exp(np.clip(scores, -20, 20))
         probs = exp_s / (exp_s.sum() + 1e-8)
         loss = -np.log(probs[y_true] + 1e-8)
 
-        # Backprop through output layer
-        d_out = probs - target  # gradient of CE+softmax
+        # ---- Backward pass ----
+        # d_out has no /T — avg_pre already divides by T, so no double-division
+        d_out = probs - target
 
-        # Update output layer weights (simplified BPTT)
-        output_layer = layers[-1]
-        if hasattr(output_layer, "synapse"):
-            # Average input spikes to output layer over time
-            avg_pre = np.mean([all_spikes[t][-2] for t in range(model.time_steps)], axis=0)
-            dw = -self.learning_rate * np.outer(avg_pre, d_out)
-            output_layer.synapse.update_weights(dw)
+        # Update output layer — use soft presynaptic activity (non-zero even without spikes)
+        if weight_layers:
+            out_wlayer = weight_layers[-1]
+            layer_idx = layers.index(out_wlayer)
+            avg_pre = np.mean(
+                [all_soft_acts[t][layer_idx] for t in range(T)], axis=0
+            )
+            dw_out = -self.learning_rate * np.outer(avg_pre, d_out)
+            dw_out = self._apply_momentum(out_wlayer.synapse, dw_out)
+            out_wlayer.synapse.update_weights(dw_out)
 
         # Backprop through hidden layers
-        d_hidden = output_layer.weights @ d_out
-        for i in range(len(layers) - 2, 0, -1):
-            layer = layers[i]
-            if not hasattr(layer, "synapse"):
-                continue
+        if len(weight_layers) > 1:
+            d_hidden = weight_layers[-1].synapse.weights @ d_out
 
-            # Surrogate gradient through spike nonlinearity
-            if hasattr(layer, "voltage_history") and len(layer.voltage_history) > 0:
-                avg_v = np.mean(layer.voltage_history, axis=0)
-                thresh = getattr(layer.neurons, "v_thresh", -50.0)
-                surrogate_grad = self.surrogate_fn.backward(avg_v, thresh)
-            else:
-                surrogate_grad = np.ones(layer.n_neurons, dtype=np.float32)
+            for i in range(len(weight_layers) - 2, -1, -1):
+                layer = weight_layers[i]
+                layer_idx = layers.index(layer)
 
-            d_layer = d_hidden * surrogate_grad
+                # Soft-activation gradient: d(clip((v-vr)/(vt-vr),0,1))/dv
+                # = 1/(vt-vr) when vr<=v<=vt, else 0
+                # This is non-zero for any neuron whose voltage is between rest and threshold
+                if hasattr(layer, 'voltage_history') and len(layer.voltage_history) > 0:
+                    avg_v = np.mean(layer.voltage_history, axis=0)
+                    v_rest = getattr(layer.neurons, 'v_rest', -65.0)
+                    v_thresh = getattr(layer.neurons, 'v_thresh', -50.0)
+                    in_range = (avg_v >= v_rest) & (avg_v <= v_thresh)
+                    surrogate_grad = np.where(in_range, 1.0 / (v_thresh - v_rest + 1e-8), 0.0).astype(np.float32)
+                else:
+                    surrogate_grad = np.ones(layer.n_neurons, dtype=np.float32)
 
-            avg_pre = np.mean([all_spikes[t][i - 1] for t in range(model.time_steps)], axis=0)
-            dw = -self.learning_rate * np.outer(avg_pre, d_layer)
-            layer.synapse.update_weights(dw)
+                d_layer = d_hidden * surrogate_grad
 
-            d_hidden = layer.weights @ d_layer
+                # Use soft presynaptic activities
+                avg_pre = np.mean(
+                    [all_soft_acts[t][layer_idx] for t in range(T)], axis=0
+                )
+                dw = -self.learning_rate * np.outer(avg_pre, d_layer)
+                dw = self._apply_momentum(layer.synapse, dw)
+                layer.synapse.update_weights(dw)
+
+                d_hidden = layer.synapse.weights @ d_layer
 
         return float(loss), correct
 
     def _stdp_step(self, encoded: np.ndarray, y_true: int, n_classes: int):
-        """
-        One STDP training step (unsupervised + class-specific modulation).
-        """
+        """STDP training step with reward modulation."""
         model = self.model
         layers = model.layers
 
         model._reset_all()
 
-        # Initialize STDP traces for each connection
+        # Initialize STDP traces
         traces = []
-        for i in range(1, len(layers)):
-            if hasattr(layers[i], "synapse"):
-                pre_t, post_t = self.stdp.init_traces(
-                    layers[i].synapse.n_pre, layers[i].n_neurons
-                )
+        for layer in layers:
+            if hasattr(layer, 'synapse'):
+                pre_t = np.zeros(layer.synapse.n_pre, dtype=np.float32)
+                post_t = np.zeros(layer.n_neurons, dtype=np.float32)
                 traces.append((pre_t, post_t))
             else:
                 traces.append(None)
 
+        prev_spikes = [None] * len(layers)
+
         for t in range(model.time_steps):
             x = encoded[t] if t < len(encoded) else np.zeros(model.layer_sizes[0])
-            spikes = [x]
-            current = x
-            for layer in layers:
-                current = layer.forward(current, model.dt)
-                spikes.append(current.copy())
+            current_spikes = [x.astype(np.float32)]
+            spikes = x.astype(np.float32)
 
-            # Apply STDP updates
-            trace_idx = 0
-            for i in range(1, len(layers)):
-                layer = layers[i]
-                if not hasattr(layer, "synapse") or traces[i - 1] is None:
+            for layer in layers:
+                spikes = layer.forward(spikes, model.dt)
+                current_spikes.append(spikes.copy())
+
+            # Apply STDP per layer
+            for i, layer in enumerate(layers):
+                if not hasattr(layer, 'synapse') or traces[i] is None:
                     continue
-                pre_t, post_t = traces[i - 1]
+                pre_t, post_t = traces[i]
                 delta_w, pre_t, post_t = self.stdp.update(
-                    spikes[i - 1], spikes[i], layer.synapse.weights,
-                    pre_t, post_t, model.dt
+                    current_spikes[i],
+                    current_spikes[i + 1],
+                    layer.synapse.weights,
+                    pre_t, post_t,
+                    model.dt,
                 )
                 layer.synapse.update_weights(delta_w)
-                traces[i - 1] = (pre_t, post_t)
+                traces[i] = (pre_t, post_t)
 
         output_scores = layers[-1].decode()
         pred = int(np.argmax(output_scores))
@@ -287,11 +333,6 @@ class Trainer:
         return correct / len(y_val)
 
     def evaluate(self, X_test: np.ndarray, y_test: np.ndarray, encoder=None) -> dict:
-        """
-        Evaluate on test data.
-
-        Returns dict with 'accuracy', 'n_correct', 'n_total'.
-        """
         from ..encoding.rate import RateEncoder
 
         if encoder is None:

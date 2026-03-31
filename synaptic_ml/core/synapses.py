@@ -7,7 +7,8 @@ from typing import Optional, Literal
 
 
 def _xavier_init(n_pre: int, n_post: int) -> np.ndarray:
-    limit = np.sqrt(6.0 / (n_pre + n_post))
+    # Scale up by 3x vs standard xavier so neurons actually fire initially
+    limit = np.sqrt(6.0 / (n_pre + n_post)) * 3.0
     return np.random.uniform(-limit, limit, (n_pre, n_post)).astype(np.float32)
 
 

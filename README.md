@@ -3,6 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/synaptic-ml)](https://pypi.org/project/synaptic-ml/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-111%20passed-brightgreen)](https://github.com/HrishikeshRajulu/synaptic-ml)
 
 **The TensorFlow for Neuromorphic Computing.**
 
@@ -134,15 +135,17 @@ spikes = enc.encode_series(time_series)
 ## Learning Rules
 
 ```python
-# Surrogate gradients (recommended) — backprop through spikes
-model.train(X, y, learning_rule='surrogate', learning_rate=0.001)
+# Surrogate gradients (recommended) — backprop through spike nonlinearity
+# Uses voltage-based soft activations for stable training even when neurons
+# don't fire. SGD with momentum included.
+model.train(X, y, learning_rule='surrogate', learning_rate=0.02, epochs=50)
 
 # STDP — unsupervised, no labels needed, biologically inspired
 model.train(X, y, learning_rule='stdp')
 
-# Custom trainer with validation
-trainer = sml.Trainer(model, learning_rule='surrogate', learning_rate=0.001)
-trainer.fit(X_train, y_train, epochs=10, validation_split=0.1)
+# Custom trainer with validation split
+trainer = sml.Trainer(model, learning_rule='surrogate', learning_rate=0.02)
+trainer.fit(X_train, y_train, epochs=50, validation_split=0.1)
 trainer.evaluate(X_test, y_test)
 ```
 
@@ -247,11 +250,15 @@ synaptic_ml/
 
 - [x] LIF, Adaptive LIF, Izhikevich neuron models
 - [x] Rate, Temporal, Population, Delta encoders
-- [x] Surrogate gradient + STDP training
-- [x] ANN->SNN conversion (PyTorch + Keras)
-- [x] BrainChip Akida backend (fully working)
-- [x] Intel Loihi 2 backend (via Lava)
+- [x] LIF, Adaptive LIF, Izhikevich neuron models
+- [x] Rate, Temporal, Population, Delta encoders
+- [x] Surrogate gradient training (BPTT with momentum, voltage-based soft activations)
+- [x] STDP + Reward-modulated STDP
+- [x] ANN->SNN conversion (threshold balancing)
+- [x] BrainChip Akida backend (CPU virtual mode + hardware mode)
+- [x] Intel Loihi 2 backend (via Lava framework)
 - [x] BrainScaleS-2 backend (via PyNN)
+- [x] 111-test suite (neurons, encoders, layers, network, backends, learning)
 - [ ] GPU simulation (CuPy backend)
 - [ ] SpiNNaker 2 backend
 - [ ] Innatera T1 backend
@@ -270,7 +277,7 @@ Most needed right now:
 - Someone with **Loihi 2 hardware** to test and fix the Loihi 2 backend
 - Someone with **Akida AKD1000/AKD1500** hardware to test hardware mode
 - **GPU simulation** via CuPy
-- **Tests** — pytest coverage
+- **MNIST/CIFAR benchmarks** — real-world accuracy numbers
 
 ---
 

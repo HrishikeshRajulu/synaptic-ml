@@ -243,6 +243,7 @@ class OutputLayer(BaseLayer):
 
         self.spike_accumulator = np.zeros(n_neurons, dtype=np.float32)
         self.max_voltage = np.full(n_neurons, -np.inf, dtype=np.float32)
+        self.current_accum = np.zeros(n_neurons, dtype=np.float32)
         self.spike_count = 0
         self.last_spikes = np.zeros(n_neurons, dtype=np.float32)
 
@@ -252,17 +253,23 @@ class OutputLayer(BaseLayer):
         self.last_spikes = spikes
         self.spike_accumulator += spikes
         self.max_voltage = np.maximum(self.max_voltage, voltage)
+        self.current_accum += current  # track total synaptic input
         self.spike_count += 1
         return spikes
 
     def decode(self) -> np.ndarray:
-        """Return class scores based on accumulated spikes."""
+        """Return class scores. Uses integrated current as fallback when neurons don't fire."""
         if self.decoder == "rate":
-            if self.spike_count == 0:
-                return np.zeros(self._n, dtype=np.float32)
-            return self.spike_accumulator / self.spike_count
+            if self.spike_accumulator.sum() > 0:
+                return self.spike_accumulator / (self.spike_count + 1e-8)
+            # Fallback: integrated current reflects weights even without spikes
+            return self.current_accum / (self.spike_count + 1e-8)
         elif self.decoder == "max_voltage":
-            return self.max_voltage
+            # Use max_voltage only if neurons actually moved
+            if not np.all(self.max_voltage == -np.inf) and not np.all(self.max_voltage == self.max_voltage[0]):
+                return self.max_voltage
+            # Fallback: integrated current
+            return self.current_accum / (self.spike_count + 1e-8)
         else:
             raise ValueError(f"Unknown decoder: {self.decoder}")
 
@@ -273,6 +280,7 @@ class OutputLayer(BaseLayer):
         self.neurons.reset_state()
         self.spike_accumulator = np.zeros(self._n, dtype=np.float32)
         self.max_voltage = np.full(self._n, -np.inf, dtype=np.float32)
+        self.current_accum = np.zeros(self._n, dtype=np.float32)
         self.spike_count = 0
         self.last_spikes = np.zeros(self._n, dtype=np.float32)
 
