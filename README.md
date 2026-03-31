@@ -196,19 +196,25 @@ model = sml.SpikingNet.load('my_snn.snm')
 
 ---
 
-## Examples
+## Quick Start
 
-```bash
-# MNIST classification with LIF neurons + surrogate gradients
-python examples/mnist_lif.py
+```python
+import numpy as np
+import synaptic_ml as sml
 
-# Unsupervised pattern learning with STDP
-python examples/pattern_recognition.py
+# Generate some data
+X = np.random.rand(1000, 16).astype('float32')
+y = (X.mean(axis=1) > 0.5).astype('int64')
 
-# IoT anomaly detection with delta encoding
-python examples/edge_sensor.py
+# Build and train
+model = sml.SpikingNet([16, 64, 2], neuron='lif', time_steps=50)
+model.train(X[:800], y[:800], epochs=30, learning_rate=0.001)
 
-# Quick self-test
+# Evaluate
+preds = model.predict(X[800:])
+print(f"Accuracy: {(preds == y[800:]).mean():.1%}")
+
+# Self-test
 python -m synaptic_ml
 ```
 
