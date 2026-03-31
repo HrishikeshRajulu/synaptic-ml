@@ -49,7 +49,10 @@ class Trainer:
 
         self.train_losses = []
         self.train_accuracies = []
-        self._velocity = {}  # momentum buffers keyed by synapse id
+        # Adam optimizer state
+        self._adam_m = {}   # first moment
+        self._adam_v = {}   # second moment
+        self._adam_t = 0    # step counter
 
     def fit(
         self,
@@ -137,12 +140,17 @@ class Trainer:
 
         return total_loss, n_correct
 
-    def _apply_momentum(self, synapse, dw: np.ndarray, momentum: float = 0.9) -> np.ndarray:
+    def _apply_adam(self, synapse, grad: np.ndarray, beta1=0.9, beta2=0.999, eps=1e-8) -> np.ndarray:
+        """Adam optimizer: adaptive learning rate per weight."""
         key = id(synapse)
-        if key not in self._velocity:
-            self._velocity[key] = np.zeros_like(dw)
-        self._velocity[key] = momentum * self._velocity[key] + dw
-        return self._velocity[key]
+        if key not in self._adam_m:
+            self._adam_m[key] = np.zeros_like(grad)
+            self._adam_v[key] = np.zeros_like(grad)
+        self._adam_m[key] = beta1 * self._adam_m[key] + (1 - beta1) * grad
+        self._adam_v[key] = beta2 * self._adam_v[key] + (1 - beta2) * grad ** 2
+        m_hat = self._adam_m[key] / (1 - beta1 ** self._adam_t + eps)
+        v_hat = self._adam_v[key] / (1 - beta2 ** self._adam_t + eps)
+        return -self.learning_rate * m_hat / (np.sqrt(v_hat) + eps)
 
     def _surrogate_step(self, encoded: np.ndarray, y_true: int, n_classes: int):
         """
@@ -220,23 +228,26 @@ class Trainer:
         loss = -np.log(probs[y_true] + 1e-8)
 
         # ---- Backward pass ----
-        # d_out has no /T — avg_pre already divides by T, so no double-division
+        self._adam_t += 1
         d_out = probs - target
+        # Clip gradient to prevent blowups
+        d_out = np.clip(d_out, -1.0, 1.0)
 
-        # Update output layer — use soft presynaptic activity (non-zero even without spikes)
+        # Update output layer using Adam
         if weight_layers:
             out_wlayer = weight_layers[-1]
             layer_idx = layers.index(out_wlayer)
             avg_pre = np.mean(
                 [all_soft_acts[t][layer_idx] for t in range(T)], axis=0
             )
-            dw_out = -self.learning_rate * np.outer(avg_pre, d_out)
-            dw_out = self._apply_momentum(out_wlayer.synapse, dw_out)
+            grad_out = np.outer(avg_pre, d_out)
+            dw_out = self._apply_adam(out_wlayer.synapse, grad_out)
             out_wlayer.synapse.update_weights(dw_out)
 
         # Backprop through hidden layers
         if len(weight_layers) > 1:
             d_hidden = weight_layers[-1].synapse.weights @ d_out
+            d_hidden = np.clip(d_hidden, -1.0, 1.0)
 
             for i in range(len(weight_layers) - 2, -1, -1):
                 layer = weight_layers[i]
@@ -244,7 +255,6 @@ class Trainer:
 
                 # Soft-activation gradient: d(clip((v-vr)/(vt-vr),0,1))/dv
                 # = 1/(vt-vr) when vr<=v<=vt, else 0
-                # This is non-zero for any neuron whose voltage is between rest and threshold
                 if hasattr(layer, 'voltage_history') and len(layer.voltage_history) > 0:
                     avg_v = np.mean(layer.voltage_history, axis=0)
                     v_rest = getattr(layer.neurons, 'v_rest', -65.0)
@@ -256,15 +266,14 @@ class Trainer:
 
                 d_layer = d_hidden * surrogate_grad
 
-                # Use soft presynaptic activities
                 avg_pre = np.mean(
                     [all_soft_acts[t][layer_idx] for t in range(T)], axis=0
                 )
-                dw = -self.learning_rate * np.outer(avg_pre, d_layer)
-                dw = self._apply_momentum(layer.synapse, dw)
+                grad_hidden = np.outer(avg_pre, d_layer)
+                dw = self._apply_adam(layer.synapse, grad_hidden)
                 layer.synapse.update_weights(dw)
 
-                d_hidden = layer.synapse.weights @ d_layer
+                d_hidden = np.clip(layer.synapse.weights @ d_layer, -1.0, 1.0)
 
         return float(loss), correct
 

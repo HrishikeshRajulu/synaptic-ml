@@ -136,15 +136,14 @@ spikes = enc.encode_series(time_series)
 
 ```python
 # Surrogate gradients (recommended) — backprop through spike nonlinearity
-# Uses voltage-based soft activations for stable training even when neurons
-# don't fire. SGD with momentum included.
-model.train(X, y, learning_rule='surrogate', learning_rate=0.02, epochs=50)
+# Uses voltage-based soft activations + Adam optimizer for stable training.
+model.train(X, y, learning_rule='surrogate', learning_rate=0.001, epochs=30)
 
 # STDP — unsupervised, no labels needed, biologically inspired
 model.train(X, y, learning_rule='stdp')
 
 # Custom trainer with validation split
-trainer = sml.Trainer(model, learning_rule='surrogate', learning_rate=0.02)
+trainer = sml.Trainer(model, learning_rule='surrogate', learning_rate=0.001)
 trainer.fit(X_train, y_train, epochs=50, validation_split=0.1)
 trainer.evaluate(X_test, y_test)
 ```
