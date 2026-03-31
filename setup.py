@@ -5,8 +5,8 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="synaptic-ml",
-    version="0.1.0",
-    author="synaptic_ml contributors",
+    version="0.1.1",
+    author="Hrishikesh Rajulu",
     description="The TensorFlow for neuromorphic computing — high-level SNN framework",
     long_description=long_description,
     long_description_content_type="text/markdown",
